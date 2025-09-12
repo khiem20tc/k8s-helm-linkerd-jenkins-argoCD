@@ -1,0 +1,285 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_REGISTRY = 'your-registry.com'
+        IMAGE_NAME = 'user-service'
+        KUBECONFIG = credentials('kubeconfig')
+        HELM_REPO = 'https://charts.example.com'
+        ARGOCD_SERVER = 'argocd.example.com'
+        ARGOCD_TOKEN = credentials('argocd-token')
+    }
+    
+    parameters {
+        string(name: 'VERSION', defaultValue: '', description: 'Version to deploy')
+        choice(name: 'ENVIRONMENT', choices: ['dev', 'staging', 'prod'], description: 'Target environment')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip running tests')
+        booleanParam(name: 'FORCE_DEPLOY', defaultValue: false, description: 'Force deployment even if tests fail')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    if (params.VERSION == '') {
+                        env.VERSION = sh(
+                            script: 'git describe --tags --always',
+                            returnStdout: true
+                        ).trim()
+                    }
+                }
+            }
+        }
+        
+        stage('Build Application') {
+            steps {
+                dir('app') {
+                    script {
+                        sh '''
+                            echo "Building Go application..."
+                            go mod download
+                            go mod verify
+                            
+                            # Generate protobuf files
+                            protoc --go_out=. --go_opt=paths=source_relative \
+                                --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+                                proto/user.proto
+                            
+                            # Build the application
+                            CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main ./src
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Run Tests') {
+            when {
+                not { params.SKIP_TESTS }
+            }
+            steps {
+                dir('app') {
+                    script {
+                        sh '''
+                            echo "Running Go tests..."
+                            go test -v ./...
+                            
+                            echo "Running Go vet..."
+                            go vet ./...
+                            
+                            echo "Running Go fmt check..."
+                            if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+                                echo "Code is not formatted. Run 'gofmt -s -w .'"
+                                exit 1
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                script {
+                    sh '''
+                        echo "Running security scan with gosec..."
+                        cd app
+                        go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
+                        gosec -fmt json -out gosec-report.json ./...
+                    '''
+                }
+            }
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'app',
+                        reportFiles: 'gosec-report.json',
+                        reportName: 'Security Scan Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def imageTag = "${DOCKER_REGISTRY}/${IMAGE_NAME}:${env.VERSION}"
+                    def latestTag = "${DOCKER_REGISTRY}/${IMAGE_NAME}:latest"
+                    
+                    dir('app') {
+                        sh """
+                            echo "Building Docker image..."
+                            docker build -t ${imageTag} -t ${latestTag} .
+                            
+                            echo "Pushing Docker image..."
+                            docker push ${imageTag}
+                            docker push ${latestTag}
+                        """
+                    }
+                    
+                    env.DOCKER_IMAGE = imageTag
+                }
+            }
+        }
+        
+        stage('Update Helm Values') {
+            steps {
+                script {
+                    sh """
+                        echo "Updating Helm values with new image..."
+                        sed -i 's|image: user-service:.*|image: ${env.DOCKER_IMAGE}|g' k8s/helm/user-service/values.yaml
+                        sed -i 's|tag: \".*\"|tag: \"${env.VERSION}\"|g' k8s/helm/user-service/values.yaml
+                    """
+                }
+            }
+        }
+        
+        stage('Package Helm Chart') {
+            steps {
+                script {
+                    sh """
+                        echo "Packaging Helm chart..."
+                        helm package k8s/helm/user-service --destination ./helm-packages
+                        
+                        echo "Updating Helm repository index..."
+                        helm repo index ./helm-packages --url ${HELM_REPO}
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Kubernetes') {
+            when {
+                anyOf {
+                    params.ENVIRONMENT == 'dev'
+                    params.ENVIRONMENT == 'staging'
+                    params.ENVIRONMENT == 'prod'
+                }
+            }
+            steps {
+                script {
+                    sh """
+                        echo "Deploying to ${params.ENVIRONMENT} environment..."
+                        
+                        # Create namespace if it doesn't exist
+                        kubectl create namespace user-service-${params.ENVIRONMENT} --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        # Install/upgrade Helm chart
+                        helm upgrade --install user-service-${params.ENVIRONMENT} ./helm-packages/user-service-0.1.0.tgz \
+                            --namespace user-service-${params.ENVIRONMENT} \
+                            --set image.tag=${env.VERSION} \
+                            --set replicaCount=2 \
+                            --wait --timeout=300s
+                        
+                        # Verify deployment
+                        kubectl rollout status deployment/user-service -n user-service-${params.ENVIRONMENT} --timeout=300s
+                    """
+                }
+            }
+        }
+        
+        stage('Update ArgoCD Application') {
+            when {
+                params.ENVIRONMENT == 'prod'
+            }
+            steps {
+                script {
+                    sh """
+                        echo "Updating ArgoCD application..."
+                        
+                        # Update the ArgoCD application with new image
+                        argocd app set user-service-prod \
+                            --helm-set image.tag=${env.VERSION} \
+                            --server ${ARGOCD_SERVER} \
+                            --auth-token ${ARGOCD_TOKEN}
+                        
+                        # Sync the application
+                        argocd app sync user-service-prod \
+                            --server ${ARGOCD_SERVER} \
+                            --auth-token ${ARGOCD_TOKEN}
+                        
+                        # Wait for sync to complete
+                        argocd app wait user-service-prod \
+                            --server ${ARGOCD_SERVER} \
+                            --auth-token ${ARGOCD_TOKEN}
+                    """
+                }
+            }
+        }
+        
+        stage('Run Integration Tests') {
+            when {
+                params.ENVIRONMENT == 'dev'
+            }
+            steps {
+                script {
+                    sh """
+                        echo "Running integration tests..."
+                        
+                        # Wait for service to be ready
+                        kubectl wait --for=condition=ready pod -l app=user-service -n user-service-${params.ENVIRONMENT} --timeout=300s
+                        
+                        # Get service endpoint
+                        SERVICE_IP=\$(kubectl get svc user-service -n user-service-${params.ENVIRONMENT} -o jsonpath='{.spec.clusterIP}')
+                        
+                        # Run basic health check
+                        kubectl run test-pod --image=curlimages/curl --rm -i --restart=Never -- \
+                            curl -f http://\${SERVICE_IP}/health
+                        
+                        echo "Integration tests passed!"
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                sh '''
+                    echo "Cleaning up..."
+                    docker system prune -f
+                '''
+            }
+        }
+        
+        success {
+            script {
+                if (params.ENVIRONMENT == 'prod') {
+                    slackSend(
+                        channel: '#deployments',
+                        color: 'good',
+                        message: "✅ Deployment successful!\n" +
+                                "Service: ${IMAGE_NAME}\n" +
+                                "Version: ${env.VERSION}\n" +
+                                "Environment: ${params.ENVIRONMENT}\n" +
+                                "Build: ${env.BUILD_URL}"
+                    )
+                }
+            }
+        }
+        
+        failure {
+            script {
+                slackSend(
+                    channel: '#deployments',
+                    color: 'danger',
+                    message: "❌ Deployment failed!\n" +
+                            "Service: ${IMAGE_NAME}\n" +
+                            "Version: ${env.VERSION}\n" +
+                            "Environment: ${params.ENVIRONMENT}\n" +
+                            "Build: ${env.BUILD_URL}\n" +
+                            "Logs: ${env.BUILD_URL}console"
+                )
+            }
+        }
+        
+        cleanup {
+            cleanWs()
+        }
+    }
+}

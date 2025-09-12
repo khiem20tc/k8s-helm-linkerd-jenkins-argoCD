@@ -1,0 +1,24 @@
+grpc:
+  port: "50051"
+
+http:
+  port: "8080"
+
+log:
+  level: "info"
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "users"
+  username: "user"
+  password: "password"
+
+redis:
+  host: "localhost"
+  port: 6379
+  password: ""
+
+metrics:
+  enabled: true
+  port: "9090"

@@ -1,0 +1,74 @@
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: user-service
+  namespace: user-service
+spec:
+  routes:
+  - name: "GET /health"
+    condition:
+      method: GET
+      pathRegex: "/health"
+    responseClasses:
+    - condition:
+        status:
+          min: 200
+          max: 299
+      isFailure: false
+    - condition:
+        status:
+          min: 500
+          max: 599
+      isFailure: true
+  - name: "GET /ready"
+    condition:
+      method: GET
+      pathRegex: "/ready"
+    responseClasses:
+    - condition:
+        status:
+          min: 200
+          max: 299
+      isFailure: false
+    - condition:
+        status:
+          min: 500
+          max: 599
+      isFailure: true
+  - name: "GET /metrics"
+    condition:
+      method: GET
+      pathRegex: "/metrics"
+    responseClasses:
+    - condition:
+        status:
+          min: 200
+          max: 299
+      isFailure: false
+    - condition:
+        status:
+          min: 500
+          max: 599
+      isFailure: true
+  - name: "gRPC UserService"
+    condition:
+      method: POST
+      pathRegex: "/user.UserService/.*"
+    responseClasses:
+    - condition:
+        status:
+          min: 200
+          max: 299
+      isFailure: false
+    - condition:
+        status:
+          min: 500
+          max: 599
+      isFailure: true
+  retryBudget:
+    retryRatio: 0.2
+    minRetriesPerSecond: 10
+    ttl: 10s
+  dstOverrides:
+  - authority: "user-service.user-service.svc.cluster.local:80"
+    weight: 10000m

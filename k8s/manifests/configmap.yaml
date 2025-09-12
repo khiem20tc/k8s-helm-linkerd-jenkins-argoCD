@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-service-config
+  namespace: user-service
+data:
+  config.yaml: |
+    grpc:
+      port: "50051"
+    
+    http:
+      port: "8080"
+    
+    log:
+      level: "info"
+    
+    metrics:
+      enabled: true
+      port: "9090"
