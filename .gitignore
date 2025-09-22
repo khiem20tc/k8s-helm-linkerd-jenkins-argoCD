@@ -5,7 +5,6 @@
 *.so
 *.dylib
 main
-user-service
 
 # Test binary, built with `go test -c`
 *.test

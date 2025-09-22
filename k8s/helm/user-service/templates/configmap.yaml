@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "user-service.fullname" . }}-config
+  labels:
+    {{- include "user-service.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    grpc:
+      port: "{{ .Values.config.grpc.port }}"
+    
+    http:
+      port: "{{ .Values.config.http.port }}"
+    
+    log:
+      level: "{{ .Values.config.log.level }}"
+    
+    metrics:
+      enabled: {{ .Values.config.metrics.enabled }}
+      port: "{{ .Values.config.metrics.port }}"

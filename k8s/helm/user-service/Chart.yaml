@@ -1,0 +1,17 @@
+apiVersion: v2
+name: user-service
+description: A Helm chart for User Service gRPC microservice
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - microservice
+  - grpc
+  - golang
+  - user-service
+home: https://github.com/khiem20tc/k8s-helm-linkerd-jenkins-argoCD
+sources:
+  - https://github.com/khiem20tc/k8s-helm-linkerd-jenkins-argoCD
+maintainers:
+  - name: Khiem
+    email: khiem@example.com
