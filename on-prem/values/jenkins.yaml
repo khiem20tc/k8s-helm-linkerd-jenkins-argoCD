@@ -1,0 +1,104 @@
+# Local overlay for the Jenkins chart, applied on top of jenkins/values.yaml.
+# __DOMAIN__ is substituted by scripts/addons.sh.
+controller:
+  jenkinsUrl: http://jenkins.__DOMAIN__
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hostName: jenkins.__DOMAIN__
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 768Mi
+    limits:
+      memory: 1536Mi
+  javaOpts: "-Xms512m -Xmx1024m"
+
+  additionalPlugins:
+    - job-dsl
+
+  # Values used by the JCasC script below (repo, branch)
+  containerEnv:
+    - name: GIT_REPO_URL
+      valueFrom:
+        configMapKeyRef:
+          name: jenkins-local-settings
+          key: git-repo-url
+    - name: GIT_REVISION
+      valueFrom:
+        configMapKeyRef:
+          name: jenkins-local-settings
+          key: git-revision
+
+  # Mounted secrets are referenced in JCasC as ${<secret>-<key>}
+  additionalExistingSecrets:
+    - name: jenkins-local-credentials
+      keyName: github-username
+    - name: jenkins-local-credentials
+      keyName: github-token
+    - name: jenkins-local-credentials
+      keyName: argocd-token
+
+  JCasC:
+    configScripts:
+      local-lab: |
+        jenkins:
+          globalNodeProperties:
+            - envVars:
+                env:
+                  # Read by jenkins/Jenkinsfile
+                  - key: CI_REGISTRY
+                    value: "kind-registry:5000"
+                  - key: CI_KANIKO_EXTRA_ARGS
+                    value: "--insecure --skip-tls-verify"
+                  - key: CI_ARGOCD_OPTS
+                    value: "--grpc-web --plaintext"
+                  - key: CI_GIT_BRANCH
+                    value: "${GIT_REVISION}"
+        credentials:
+          system:
+            domainCredentials:
+              - credentials:
+                  - usernamePassword:
+                      scope: GLOBAL
+                      id: git-credentials
+                      description: "Push access to the GitOps repository"
+                      username: "${jenkins-local-credentials-github-username}"
+                      password: "${jenkins-local-credentials-github-token}"
+                  - string:
+                      scope: GLOBAL
+                      id: argocd-token
+                      description: "Argo CD API token (account: jenkins)"
+                      secret: "${jenkins-local-credentials-argocd-token}"
+        jobs:
+          - script: >
+              pipelineJob('user-service') {
+                description('user-service CI/CD (local lab)')
+                properties {
+                  pipelineTriggers {
+                    triggers {
+                      // GitHub cannot reach a local Jenkins, so poll instead of webhooks
+                      pollSCM { scmpoll_spec('H/2 * * * *') }
+                    }
+                  }
+                }
+                definition {
+                  cpsScm {
+                    scm {
+                      git {
+                        remote {
+                          url('${GIT_REPO_URL}')
+                          credentials('git-credentials')
+                        }
+                        branch('*/${GIT_REVISION}')
+                      }
+                    }
+                    scriptPath('jenkins/Jenkinsfile')
+                    lightweight(true)
+                  }
+                }
+              }
+
+persistence:
+  size: 4Gi

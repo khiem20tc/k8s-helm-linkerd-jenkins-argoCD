@@ -1,10 +1,13 @@
-# Default values for user-service
+# Default values for user-service.
+# Environment-specific overrides live in values-<env>.yaml. The image tag in
+# those files is updated by the Jenkins pipeline and synced by ArgoCD.
 replicaCount: 3
 
 image:
-  repository: user-service
+  repository: your-registry.com/user-service
   pullPolicy: IfNotPresent
-  tag: "latest"
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
 
 imagePullSecrets: []
 nameOverride: ""
@@ -41,11 +44,10 @@ service:
 ingress:
   enabled: true
   className: "nginx"
+  # Exposes the HTTP port (health/readiness/metrics). gRPC is reachable in-cluster
+  # on the Service's grpc port; exposing it through ingress-nginx requires TLS.
   annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
-    nginx.ingress.kubernetes.io/use-regex: "true"
-    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
   hosts:
     - host: user-service.local
       paths:
@@ -81,9 +83,12 @@ config:
     port: "8080"
   log:
     level: "info"
-  metrics:
+
+linkerd:
+  # Requires the Linkerd CRDs (installed by `linkerd install --crds`).
+  serviceProfile:
     enabled: true
-    port: "9090"
+    clusterDomain: cluster.local
 
 livenessProbe:
   httpGet:

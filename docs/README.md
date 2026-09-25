@@ -23,7 +23,7 @@ This repository demonstrates a complete GitOps workflow for deploying a Golang g
 ## Components
 
 ### 1. Golang gRPC Microservice
-- **Language**: Go 1.21
+- **Language**: Go 1.23
 - **Protocol**: gRPC with HTTP health checks
 - **Features**: User CRUD operations, health checks, metrics
 - **Ports**: 8080 (HTTP), 50051 (gRPC)
@@ -34,13 +34,13 @@ This repository demonstrates a complete GitOps workflow for deploying a Golang g
 - **Namespaces**: Environment-specific namespaces
 
 ### 3. Linkerd Service Mesh
-- **Service Profiles**: Traffic routing and retry policies
-- **Traffic Splits**: Canary deployments
-- **Observability**: Metrics, tracing, and monitoring
+- **Service Profiles**: Per-route metrics, retries for read-only gRPC calls and timeouts (rendered by the Helm chart)
+- **mTLS**: Automatic between meshed pods
+- **Observability**: Golden metrics via `linkerd viz`
 
 ### 4. Jenkins CI/CD
-- **Pipeline**: Multi-stage build, test, and deploy
-- **Features**: Security scanning, integration tests, Slack notifications
+- **Pipeline**: Test, security scan, build image with kaniko, commit the new image tag to Git
+- **Features**: Image promotion between environments, manual approval for prod, smoke tests, Slack notifications
 - **Environments**: Dev, Staging, Production
 
 ### 5. ArgoCD GitOps
@@ -62,46 +62,42 @@ This repository demonstrates a complete GitOps workflow for deploying a Golang g
 ### 1. Setup Infrastructure
 
 ```bash
-# Install Linkerd
-linkerd install | kubectl apply -f -
-linkerd check
-
-# Install ArgoCD
-kubectl create namespace argocd
-kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-
-# Install Jenkins
-kubectl create namespace jenkins
-helm repo add jenkins https://charts.jenkins.io
-helm install jenkins jenkins/jenkins -n jenkins
+# Installs Linkerd, ArgoCD, Jenkins (jenkins/values.yaml), Prometheus/Grafana,
+# creates the namespaces and applies the ArgoCD app-of-apps
+DOCKER_REGISTRY=<your-registry> make setup-infrastructure
 ```
+
+Before running the pipeline, set `DOCKER_REGISTRY` in `jenkins/Jenkinsfile` and
+`image.repository` in `k8s/helm/user-service/values.yaml`, then create:
+
+- Kubernetes secret `registry-credentials` (type `docker-registry`) in the `jenkins` namespace, used by kaniko to push
+- Jenkins credential `git-credentials` (username + token with push access to this repo)
+- Jenkins credential `argocd-token` (secret text, ArgoCD API token)
 
 ### 2. Build and Deploy
 
 ```bash
-# Build the application
-cd app
-docker build -t user-service:latest .
+# Run tests and build the application
+make test build
 
-# Deploy using Helm
-cd ../k8s/helm
-helm install user-service ./user-service --namespace user-service --create-namespace
+# GitOps (recommended): ArgoCD deploys whatever values-<env>.yaml points at
+make argocd-apps
 
-# Deploy ArgoCD applications
-kubectl apply -f ../argocd/applications/
+# Manual deploy to a cluster without ArgoCD
+make deploy-dev VERSION=dev-1
 ```
 
 ### 3. Verify Deployment
 
 ```bash
 # Check pods
-kubectl get pods -n user-service
+kubectl get pods -n user-service-dev
 
 # Check services
-kubectl get svc -n user-service
+kubectl get svc -n user-service-dev
 
 # Test health endpoint
-kubectl port-forward svc/user-service 8080:80 -n user-service
+kubectl port-forward svc/user-service-dev 8080:80 -n user-service-dev
 curl http://localhost:8080/health
 ```
 
@@ -115,16 +111,15 @@ git add .
 git commit -m "feat: add new user endpoint"
 git push origin main
 
-# 2. Jenkins automatically triggers
-# - Builds Docker image
+# 2. Jenkins automatically triggers (ENVIRONMENT=dev)
 # - Runs tests and security scans
-# - Updates Helm values
-# - Deploys to dev environment
+# - Builds and pushes <registry>/user-service:<git describe>
+# - Commits the new tag to k8s/helm/user-service/values-dev.yaml ([skip ci])
 
 # 3. ArgoCD syncs changes
-# - Monitors Git repository
-# - Applies changes to Kubernetes
-# - Provides rollback capabilities
+# - Detects the commit and rolls out the new image
+# - Jenkins waits for the app to be Synced/Healthy, then runs a smoke test
+# - Rollback = revert the commit in Git
 ```
 
 ### 2. Production Deployment
@@ -134,13 +129,12 @@ git push origin main
 git tag v1.0.0
 git push origin v1.0.0
 
-# 2. Jenkins builds production image
-# - Tags image with version
-# - Runs comprehensive tests
-# - Updates ArgoCD application
+# 2. Promote the already-tested image (no rebuild)
+# Run the Jenkins job with ENVIRONMENT=staging, VERSION=v1.0.0,
+# then ENVIRONMENT=prod, VERSION=v1.0.0 (requires manual approval)
 
 # 3. ArgoCD deploys to production
-# - Validates configuration
+# - Syncs values-prod.yaml
 # - Performs rolling update
 # - Monitors deployment health
 ```
@@ -151,20 +145,22 @@ git push origin v1.0.0
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `GRPC_PORT` | gRPC server port | 50051 |
-| `HTTP_PORT` | HTTP server port | 8080 |
-| `LOG_LEVEL` | Logging level | info |
-| `CONFIG_PATH` | Config file path | /app/configs/config.yaml |
+| `GRPC_PORT` | gRPC server port (overrides `grpc.port`) | 50051 |
+| `HTTP_PORT` | HTTP server port (overrides `http.port`) | 8080 |
+| `LOG_LEVEL` | Logging level (overrides `log.level`) | info |
+| `CONFIG_PATH` | Config file path | ./configs/config.yaml |
 
 ### Helm Values
 
-Key configuration options in `values.yaml`:
+Shared defaults live in `values.yaml`; per-environment overrides (including the
+image tag that Jenkins updates) live in `values-dev.yaml`, `values-staging.yaml`
+and `values-prod.yaml`.
 
 ```yaml
 replicaCount: 3
 image:
-  repository: user-service
-  tag: "latest"
+  repository: your-registry.com/user-service
+  tag: ""  # set per environment
 service:
   type: ClusterIP
   port: 80
@@ -184,16 +180,18 @@ autoscaling:
 linkerd dashboard
 
 # View service metrics
-linkerd stat deployment -n user-service
+linkerd viz stat deployment -n user-service-dev
 ```
 
 ### Prometheus Metrics
 
 The service exposes metrics at `/metrics` endpoint:
 
-- `http_requests_total`: Total HTTP requests
-- `grpc_requests_total`: Total gRPC requests
-- `service_uptime`: Service uptime
+- `grpc_server_started_total`, `grpc_server_handled_total`: gRPC requests by method and status code
+- `grpc_server_msg_received_total`, `grpc_server_msg_sent_total`: gRPC messages
+- `go_*`, `process_*`: Go runtime and process metrics
+
+The server also implements the standard gRPC health checking protocol (`grpc.health.v1.Health`).
 
 ### Health Checks
 
@@ -213,8 +211,7 @@ The service exposes metrics at `/metrics` endpoint:
 ### Network Security
 
 - Linkerd mTLS between services
-- Network policies for traffic control
-- RBAC for Kubernetes resources
+- Dedicated ServiceAccount per release
 
 ## Troubleshooting
 
@@ -222,14 +219,14 @@ The service exposes metrics at `/metrics` endpoint:
 
 1. **Pod not starting**
    ```bash
-   kubectl describe pod <pod-name> -n user-service
-   kubectl logs <pod-name> -n user-service
+   kubectl describe pod <pod-name> -n user-service-dev
+   kubectl logs <pod-name> -c user-service -n user-service-dev
    ```
 
 2. **Service not accessible**
    ```bash
-   kubectl get svc -n user-service
-   kubectl get endpoints -n user-service
+   kubectl get svc -n user-service-dev
+   kubectl get endpoints -n user-service-dev
    ```
 
 3. **ArgoCD sync issues**
@@ -242,10 +239,10 @@ The service exposes metrics at `/metrics` endpoint:
 
 ```bash
 # Check Linkerd injection
-kubectl get pods -n user-service -o yaml | grep linkerd
+kubectl get pods -n user-service-dev -o yaml | grep linkerd
 
 # View service mesh traffic
-linkerd tap deployment/user-service -n user-service
+linkerd viz tap deployment/user-service-dev -n user-service-dev
 
 # Check ArgoCD application status
 argocd app list

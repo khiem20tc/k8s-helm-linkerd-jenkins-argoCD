@@ -4,18 +4,19 @@ metadata:
   name: user-service
   namespace: user-service
   labels:
-    app: user-service
-    version: v1
+    app.kubernetes.io/name: user-service
+    app.kubernetes.io/instance: user-service
 spec:
-  replicas: 3
+  # Replica count is managed by the HPA (hpa.yaml)
   selector:
     matchLabels:
-      app: user-service
+      app.kubernetes.io/name: user-service
+      app.kubernetes.io/instance: user-service
   template:
     metadata:
       labels:
-        app: user-service
-        version: v1
+        app.kubernetes.io/name: user-service
+        app.kubernetes.io/instance: user-service
       annotations:
         linkerd.io/inject: enabled
         prometheus.io/scrape: "true"
@@ -24,7 +25,7 @@ spec:
     spec:
       containers:
       - name: user-service
-        image: user-service:latest
+        image: your-registry.com/user-service:latest
         ports:
         - containerPort: 8080
           name: http

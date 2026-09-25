@@ -1,0 +1,43 @@
+{{- if .Values.linkerd.serviceProfile.enabled }}
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  # ServiceProfiles must be named after the Service's fully qualified DNS name
+  name: {{ include "user-service.fullname" . }}.{{ .Release.Namespace }}.svc.{{ .Values.linkerd.serviceProfile.clusterDomain }}
+  labels:
+    {{- include "user-service.labels" . | nindent 4 }}
+spec:
+  routes:
+  {{- range $method := list "GetUser" "ListUsers" }}
+  - name: {{ $method }}
+    condition:
+      method: POST
+      pathRegex: /user\.UserService/{{ $method }}
+    # Read-only calls are safe to retry
+    isRetryable: true
+    timeout: 5s
+  {{- end }}
+  {{- range $method := list "CreateUser" "UpdateUser" "DeleteUser" }}
+  - name: {{ $method }}
+    condition:
+      method: POST
+      pathRegex: /user\.UserService/{{ $method }}
+    timeout: 5s
+  {{- end }}
+  - name: GET /health
+    condition:
+      method: GET
+      pathRegex: /health
+  - name: GET /ready
+    condition:
+      method: GET
+      pathRegex: /ready
+  - name: GET /metrics
+    condition:
+      method: GET
+      pathRegex: /metrics
+  retryBudget:
+    retryRatio: 0.2
+    minRetriesPerSecond: 10
+    ttl: 10s
+{{- end }}

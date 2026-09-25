@@ -1,0 +1,27 @@
+# Development overrides. image.tag is updated by Jenkins (see jenkins/Jenkinsfile).
+image:
+  tag: "latest"
+
+replicaCount: 1
+
+autoscaling:
+  enabled: false
+
+ingress:
+  hosts:
+    - host: user-service-dev.local
+      paths:
+        - path: /
+          pathType: Prefix
+
+config:
+  log:
+    level: "debug"
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi

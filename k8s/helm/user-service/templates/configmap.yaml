@@ -7,14 +7,10 @@ metadata:
 data:
   config.yaml: |
     grpc:
-      port: "{{ .Values.config.grpc.port }}"
-    
+      port: {{ .Values.config.grpc.port | quote }}
+
     http:
-      port: "{{ .Values.config.http.port }}"
-    
+      port: {{ .Values.config.http.port | quote }}
+
     log:
-      level: "{{ .Values.config.log.level }}"
-    
-    metrics:
-      enabled: {{ .Values.config.metrics.enabled }}
-      port: "{{ .Values.config.metrics.port }}"
+      level: {{ .Values.config.log.level | quote }}

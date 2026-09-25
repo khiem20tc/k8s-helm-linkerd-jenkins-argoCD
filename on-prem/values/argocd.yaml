@@ -1,0 +1,44 @@
+# Argo CD for the local lab (chart: argo/argo-cd). __DOMAIN__ is substituted by scripts/addons.sh.
+global:
+  domain: argocd.__DOMAIN__
+  # The chart's NetworkPolicies break DNS and repo-server's self health check under
+  # kindnet's policy enforcement (liveness probe timeouts, CrashLoopBackOff).
+  networkPolicy:
+    create: false
+
+configs:
+  params:
+    # TLS is not terminated locally; the UI is served over plain HTTP via ingress
+    server.insecure: true
+  cm:
+    # Poll Git every minute (Jenkins also triggers a refresh after pushing)
+    timeout.reconciliation: 60s
+    # API-only account used by the Jenkins pipeline
+    accounts.jenkins: apiKey
+  rbac:
+    policy.csv: |
+      p, role:ci, applications, get, */*, allow
+      p, role:ci, applications, sync, */*, allow
+      g, jenkins, role:ci
+
+server:
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+
+# Not needed locally; saves memory
+dex:
+  enabled: false
+notifications:
+  enabled: false
+
+controller:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+repoServer:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi

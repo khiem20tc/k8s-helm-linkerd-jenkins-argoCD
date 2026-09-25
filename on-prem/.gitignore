@@ -1,0 +1,5 @@
+# Local state: downloaded tools, kubeconfig, helm cache, secrets
+.bin/
+.kube/
+.helm/
+.env

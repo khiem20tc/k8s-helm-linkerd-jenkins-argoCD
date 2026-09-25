@@ -1,0 +1,23 @@
+# Production overrides. image.tag is updated by Jenkins (see jenkins/Jenkinsfile).
+image:
+  tag: "latest"
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+
+ingress:
+  hosts:
+    - host: user-service-prod.local
+      paths:
+        - path: /
+          pathType: Prefix
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+  requests:
+    cpu: 200m
+    memory: 256Mi

@@ -1,260 +1,284 @@
+// CI pipeline for user-service.
+//
+// GitOps flow: Jenkins builds, tests and pushes an immutable image, then commits
+// the new image tag to k8s/helm/user-service/values-<env>.yaml. ArgoCD watches
+// that file and performs the actual deployment. Jenkins never deploys directly.
+//
+// Required Jenkins credentials:
+//   git-credentials   Username/password (or token) allowed to push to this repo
+//   argocd-token      Secret text: ArgoCD API token (read access to the apps)
+// Required Kubernetes secret in the agent namespace:
+//   registry-credentials  type kubernetes.io/dockerconfigjson, used by kaniko to push
+//
+// Optional global environment variables (set by on-prem/values/jenkins.yaml for the local lab):
+//   CI_REGISTRY           Registry to push to (default: your-registry.com)
+//   CI_KANIKO_EXTRA_ARGS  Extra kaniko flags, e.g. "--insecure" for a plain HTTP registry
+//   CI_ARGOCD_OPTS        argocd CLI flags (default: --grpc-web --insecure)
+//   CI_GIT_BRANCH         Branch that holds the GitOps manifests (default: main)
+
 pipeline {
-    agent any
-    
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: golang
+      image: golang:1.23
+      command: ["cat"]
+      tty: true
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:v1.23.2-debug
+      command: ["/busybox/cat"]
+      tty: true
+      volumeMounts:
+        - name: registry-credentials
+          mountPath: /kaniko/.docker
+    - name: argocd
+      image: quay.io/argoproj/argocd:v2.12.4
+      command: ["cat"]
+      tty: true
+  volumes:
+    - name: registry-credentials
+      secret:
+        secretName: registry-credentials
+        items:
+          - key: .dockerconfigjson
+            path: config.json
+'''
+        }
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
     environment {
-        DOCKER_REGISTRY = 'your-registry.com'
+        DOCKER_REGISTRY = "${env.CI_REGISTRY ?: 'your-registry.com'}"
+        KANIKO_EXTRA_ARGS = "${env.CI_KANIKO_EXTRA_ARGS ?: ''}"
         IMAGE_NAME = 'user-service'
-        KUBECONFIG = credentials('kubeconfig')
-        HELM_REPO = 'https://charts.example.com'
-        ARGOCD_SERVER = 'argocd.example.com'
-        ARGOCD_TOKEN = credentials('argocd-token')
+        GIT_BRANCH_TARGET = "${env.CI_GIT_BRANCH ?: 'main'}"
+        ARGOCD_SERVER = 'argocd-server.argocd.svc.cluster.local'
+        // argocd-server uses a self-signed certificate by default
+        ARGOCD_OPTS = "${env.CI_ARGOCD_OPTS ?: '--grpc-web --insecure'}"
     }
-    
+
     parameters {
-        string(name: 'VERSION', defaultValue: '', description: 'Version to deploy')
         choice(name: 'ENVIRONMENT', choices: ['dev', 'staging', 'prod'], description: 'Target environment')
-        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip running tests')
-        booleanParam(name: 'FORCE_DEPLOY', defaultValue: false, description: 'Force deployment even if tests fail')
+        string(name: 'VERSION', defaultValue: '', description: 'Existing image tag to promote. Leave empty to build a new image from this commit.')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip unit tests and security scan')
     }
-    
+
     stages {
         stage('Checkout') {
             steps {
-                checkout scm
-                script {
-                    if (params.VERSION == '') {
-                        env.VERSION = sh(
+                container('golang') {
+                    script {
+                        // The workspace is owned by the Jenkins agent user, not root
+                        sh 'git config --global --add safe.directory "$WORKSPACE"'
+
+                        // Commits pushed by this pipeline are tagged [skip ci] to avoid a build loop
+                        def lastMessage = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
+                        env.SKIP_CI = lastMessage.contains('[skip ci]') ? 'true' : 'false'
+                        if (env.SKIP_CI == 'true') {
+                            currentBuild.result = 'NOT_BUILT'
+                            currentBuild.description = 'Skipped: [skip ci] commit'
+                        }
+
+                        env.BUILD_IMAGE = params.VERSION ? 'false' : 'true'
+                        env.VERSION = params.VERSION ?: sh(
                             script: 'git describe --tags --always',
                             returnStdout: true
                         ).trim()
+                        env.DOCKER_IMAGE = "${env.DOCKER_REGISTRY}/${env.IMAGE_NAME}:${env.VERSION}"
+                        echo "Image: ${env.DOCKER_IMAGE} (build: ${env.BUILD_IMAGE}), environment: ${params.ENVIRONMENT}"
                     }
                 }
             }
         }
-        
-        stage('Build Application') {
-            steps {
-                dir('app') {
-                    script {
-                        sh '''
-                            echo "Building Go application..."
-                            go mod download
-                            go mod verify
-                            
-                            # Generate protobuf files
-                            protoc --go_out=. --go_opt=paths=source_relative \
-                                --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-                                proto/user.proto
-                            
-                            # Build the application
-                            CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main ./src
-                        '''
+
+        stage('CI/CD') {
+            when {
+                expression { env.SKIP_CI != 'true' }
+            }
+            stages {
+                stage('Unit Tests') {
+                    when {
+                        expression { env.BUILD_IMAGE == 'true' && !params.SKIP_TESTS }
+                    }
+                    steps {
+                        container('golang') {
+                            dir('app') {
+                                sh '''
+                                    go mod download
+                                    go mod verify
+
+                                    echo "Running go vet..."
+                                    go vet ./...
+
+                                    echo "Checking formatting..."
+                                    unformatted=$(gofmt -s -l .)
+                                    if [ -n "$unformatted" ]; then
+                                        echo "Code is not formatted. Run 'gofmt -s -w .' on:"
+                                        echo "$unformatted"
+                                        exit 1
+                                    fi
+
+                                    echo "Running tests..."
+                                    go test -race -v ./...
+                                '''
+                            }
+                        }
                     }
                 }
-            }
-        }
-        
-        stage('Run Tests') {
-            when {
-                not { params.SKIP_TESTS }
-            }
-            steps {
-                dir('app') {
-                    script {
-                        sh '''
-                            echo "Running Go tests..."
-                            go test -v ./...
-                            
-                            echo "Running Go vet..."
-                            go vet ./...
-                            
-                            echo "Running Go fmt check..."
-                            if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
-                                echo "Code is not formatted. Run 'gofmt -s -w .'"
-                                exit 1
-                            fi
-                        '''
+
+                stage('Security Scan') {
+                    when {
+                        expression { env.BUILD_IMAGE == 'true' && !params.SKIP_TESTS }
+                    }
+                    steps {
+                        container('golang') {
+                            dir('app') {
+                                sh '''
+                                    go install github.com/securego/gosec/v2/cmd/gosec@v2.21.4
+                                    gosec -exclude-generated -fmt json -out gosec-report.json -stdout -verbose=text ./...
+                                '''
+                            }
+                        }
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'app/gosec-report.json', allowEmptyArchive: true
+                        }
                     }
                 }
-            }
-        }
-        
-        stage('Security Scan') {
-            steps {
-                script {
-                    sh '''
-                        echo "Running security scan with gosec..."
-                        cd app
-                        go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
-                        gosec -fmt json -out gosec-report.json ./...
-                    '''
-                }
-            }
-            post {
-                always {
-                    publishHTML([
-                        allowMissing: false,
-                        alwaysLinkToLastBuild: true,
-                        keepAll: true,
-                        reportDir: 'app',
-                        reportFiles: 'gosec-report.json',
-                        reportName: 'Security Scan Report'
-                    ])
-                }
-            }
-        }
-        
-        stage('Build Docker Image') {
-            steps {
-                script {
-                    def imageTag = "${DOCKER_REGISTRY}/${IMAGE_NAME}:${env.VERSION}"
-                    def latestTag = "${DOCKER_REGISTRY}/${IMAGE_NAME}:latest"
-                    
-                    dir('app') {
-                        sh """
-                            echo "Building Docker image..."
-                            docker build -t ${imageTag} -t ${latestTag} .
-                            
-                            echo "Pushing Docker image..."
-                            docker push ${imageTag}
-                            docker push ${latestTag}
-                        """
+
+                stage('Build & Push Image') {
+                    when {
+                        expression { env.BUILD_IMAGE == 'true' }
                     }
-                    
-                    env.DOCKER_IMAGE = imageTag
+                    steps {
+                        container('kaniko') {
+                            sh '''
+                                /kaniko/executor \
+                                    --context "$WORKSPACE/app" \
+                                    --dockerfile "$WORKSPACE/app/Dockerfile" \
+                                    --destination "$DOCKER_IMAGE" \
+                                    --cache=true \
+                                    $KANIKO_EXTRA_ARGS
+                            '''
+                        }
+                    }
                 }
-            }
-        }
-        
-        stage('Update Helm Values') {
-            steps {
-                script {
-                    sh """
-                        echo "Updating Helm values with new image..."
-                        sed -i 's|image: user-service:.*|image: ${env.DOCKER_IMAGE}|g' k8s/helm/user-service/values.yaml
-                        sed -i 's|tag: \".*\"|tag: \"${env.VERSION}\"|g' k8s/helm/user-service/values.yaml
-                    """
+
+                stage('Approve Production') {
+                    when {
+                        expression { params.ENVIRONMENT == 'prod' }
+                    }
+                    steps {
+                        timeout(time: 1, unit: 'HOURS') {
+                            input message: "Deploy ${env.DOCKER_IMAGE} to production?", ok: 'Deploy'
+                        }
+                    }
                 }
-            }
-        }
-        
-        stage('Package Helm Chart') {
-            steps {
-                script {
-                    sh """
-                        echo "Packaging Helm chart..."
-                        helm package k8s/helm/user-service --destination ./helm-packages
-                        
-                        echo "Updating Helm repository index..."
-                        helm repo index ./helm-packages --url ${HELM_REPO}
-                    """
+
+                stage('Update GitOps Manifest') {
+                    when {
+                        // Multibranch jobs only deploy from the main branch
+                        expression { !env.BRANCH_NAME || env.BRANCH_NAME == env.GIT_BRANCH_TARGET }
+                    }
+                    steps {
+                        container('golang') {
+                            withCredentials([gitUsernamePassword(credentialsId: 'git-credentials', gitToolName: 'Default')]) {
+                                sh '''
+                                    VALUES_FILE="k8s/helm/user-service/values-${ENVIRONMENT}.yaml"
+
+                                    git config user.name "jenkins-ci"
+                                    git config user.email "jenkins-ci@users.noreply.github.com"
+
+                                    git fetch origin "$GIT_BRANCH_TARGET"
+                                    git checkout -B "$GIT_BRANCH_TARGET" "origin/$GIT_BRANCH_TARGET"
+
+                                    # values-<env>.yaml only has one "  tag:" line (image.tag)
+                                    sed -i -E "s|^(  tag: ).*|\\1\\"${VERSION}\\"|" "$VALUES_FILE"
+                                    grep -n '  tag:' "$VALUES_FILE"
+
+                                    if git diff --quiet -- "$VALUES_FILE"; then
+                                        echo "${ENVIRONMENT} already points at ${VERSION}, nothing to commit"
+                                        exit 0
+                                    fi
+
+                                    git add "$VALUES_FILE"
+                                    git commit -m "deploy(${ENVIRONMENT}): user-service ${VERSION} [skip ci]"
+
+                                    # Retry in case someone pushed in the meantime
+                                    for attempt in 1 2 3; do
+                                        if git push origin "HEAD:$GIT_BRANCH_TARGET"; then
+                                            exit 0
+                                        fi
+                                        echo "Push rejected (attempt $attempt), rebasing..."
+                                        git fetch origin "$GIT_BRANCH_TARGET"
+                                        git rebase "origin/$GIT_BRANCH_TARGET"
+                                    done
+                                    echo "Failed to push GitOps change"
+                                    exit 1
+                                '''
+                            }
+                        }
+                    }
                 }
-            }
-        }
-        
-        stage('Deploy to Kubernetes') {
-            when {
-                anyOf {
-                    params.ENVIRONMENT == 'dev'
-                    params.ENVIRONMENT == 'staging'
-                    params.ENVIRONMENT == 'prod'
+
+                stage('Wait for ArgoCD Sync') {
+                    when {
+                        expression { !env.BRANCH_NAME || env.BRANCH_NAME == env.GIT_BRANCH_TARGET }
+                    }
+                    steps {
+                        container('argocd') {
+                            withCredentials([string(credentialsId: 'argocd-token', variable: 'ARGOCD_AUTH_TOKEN')]) {
+                                sh '''
+                                    APP="user-service-${ENVIRONMENT}"
+
+                                    # Pick up the new commit now instead of waiting for the polling interval
+                                    argocd app get "$APP" --refresh > /dev/null
+                                    argocd app wait "$APP" --sync --health --timeout 600
+                                '''
+                            }
+                        }
+                    }
                 }
-            }
-            steps {
-                script {
-                    sh """
-                        echo "Deploying to ${params.ENVIRONMENT} environment..."
-                        
-                        # Create namespace if it doesn't exist
-                        kubectl create namespace user-service-${params.ENVIRONMENT} --dry-run=client -o yaml | kubectl apply -f -
-                        
-                        # Install/upgrade Helm chart
-                        helm upgrade --install user-service-${params.ENVIRONMENT} ./helm-packages/user-service-0.1.0.tgz \
-                            --namespace user-service-${params.ENVIRONMENT} \
-                            --set image.tag=${env.VERSION} \
-                            --set replicaCount=2 \
-                            --wait --timeout=300s
-                        
-                        # Verify deployment
-                        kubectl rollout status deployment/user-service -n user-service-${params.ENVIRONMENT} --timeout=300s
-                    """
-                }
-            }
-        }
-        
-        stage('Update ArgoCD Application') {
-            when {
-                params.ENVIRONMENT == 'prod'
-            }
-            steps {
-                script {
-                    sh """
-                        echo "Updating ArgoCD application..."
-                        
-                        # Update the ArgoCD application with new image
-                        argocd app set user-service-prod \
-                            --helm-set image.tag=${env.VERSION} \
-                            --server ${ARGOCD_SERVER} \
-                            --auth-token ${ARGOCD_TOKEN}
-                        
-                        # Sync the application
-                        argocd app sync user-service-prod \
-                            --server ${ARGOCD_SERVER} \
-                            --auth-token ${ARGOCD_TOKEN}
-                        
-                        # Wait for sync to complete
-                        argocd app wait user-service-prod \
-                            --server ${ARGOCD_SERVER} \
-                            --auth-token ${ARGOCD_TOKEN}
-                    """
-                }
-            }
-        }
-        
-        stage('Run Integration Tests') {
-            when {
-                params.ENVIRONMENT == 'dev'
-            }
-            steps {
-                script {
-                    sh """
-                        echo "Running integration tests..."
-                        
-                        # Wait for service to be ready
-                        kubectl wait --for=condition=ready pod -l app=user-service -n user-service-${params.ENVIRONMENT} --timeout=300s
-                        
-                        # Get service endpoint
-                        SERVICE_IP=\$(kubectl get svc user-service -n user-service-${params.ENVIRONMENT} -o jsonpath='{.spec.clusterIP}')
-                        
-                        # Run basic health check
-                        kubectl run test-pod --image=curlimages/curl --rm -i --restart=Never -- \
-                            curl -f http://\${SERVICE_IP}/health
-                        
-                        echo "Integration tests passed!"
-                    """
+
+                stage('Smoke Test') {
+                    when {
+                        expression { !env.BRANCH_NAME || env.BRANCH_NAME == env.GIT_BRANCH_TARGET }
+                    }
+                    steps {
+                        container('golang') {
+                            sh '''
+                                URL="http://user-service-${ENVIRONMENT}.user-service-${ENVIRONMENT}.svc.cluster.local/health"
+                                echo "Checking $URL"
+                                curl -fsS --retry 10 --retry-delay 5 --retry-all-errors "$URL"
+                                echo
+                                echo "Smoke test passed!"
+                            '''
+                        }
+                    }
                 }
             }
         }
     }
-    
+
     post {
-        always {
-            script {
-                sh '''
-                    echo "Cleaning up..."
-                    docker system prune -f
-                '''
-            }
-        }
-        
         success {
             script {
-                if (params.ENVIRONMENT == 'prod') {
+                if (env.SKIP_CI != 'true' && params.ENVIRONMENT == 'prod') {
                     slackSend(
                         channel: '#deployments',
                         color: 'good',
                         message: "✅ Deployment successful!\n" +
-                                "Service: ${IMAGE_NAME}\n" +
+                                "Service: ${env.IMAGE_NAME}\n" +
                                 "Version: ${env.VERSION}\n" +
                                 "Environment: ${params.ENVIRONMENT}\n" +
                                 "Build: ${env.BUILD_URL}"
@@ -262,22 +286,20 @@ pipeline {
                 }
             }
         }
-        
+
         failure {
-            script {
-                slackSend(
-                    channel: '#deployments',
-                    color: 'danger',
-                    message: "❌ Deployment failed!\n" +
-                            "Service: ${IMAGE_NAME}\n" +
-                            "Version: ${env.VERSION}\n" +
-                            "Environment: ${params.ENVIRONMENT}\n" +
-                            "Build: ${env.BUILD_URL}\n" +
-                            "Logs: ${env.BUILD_URL}console"
-                )
-            }
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: "❌ Deployment failed!\n" +
+                        "Service: ${env.IMAGE_NAME}\n" +
+                        "Version: ${env.VERSION}\n" +
+                        "Environment: ${params.ENVIRONMENT}\n" +
+                        "Build: ${env.BUILD_URL}\n" +
+                        "Logs: ${env.BUILD_URL}console"
+            )
         }
-        
+
         cleanup {
             cleanWs()
         }

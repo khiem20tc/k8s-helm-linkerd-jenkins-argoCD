@@ -14,7 +14,28 @@ YELLOW := \033[1;33m
 BLUE := \033[0;34m
 NC := \033[0m # No Color
 
-.PHONY: help build test deploy clean setup-infrastructure
+# SAFETY: this is a test repo. Cluster targets only ever use the local kind
+# cluster from on-prem/ (see on-prem/README.md), never the default ~/.kube/config.
+export KUBECONFIG := $(CURDIR)/on-prem/.kube/config
+
+HELM_CHART := k8s/helm/$(IMAGE_NAME)
+RELEASE := $(IMAGE_NAME)-$(ENVIRONMENT)
+ENV_NAMESPACE := $(NAMESPACE)-$(ENVIRONMENT)
+
+.PHONY: guard-local help proto build test lint security-scan docker-build docker-push docker-run \
+	k8s-apply k8s-delete k8s-status helm-lint helm-template helm-install helm-uninstall helm-upgrade helm-status \
+	linkerd-install linkerd-inject linkerd-dashboard argocd-install argocd-apps argocd-dashboard \
+	jenkins-install jenkins-dashboard deploy-dev deploy-staging deploy-prod setup-infrastructure \
+	clean logs port-forward health-check ci-build all dev-setup
+
+# Refuse to run cluster targets unless KUBECONFIG points at a local API server
+guard-local:
+	@test -f "$(KUBECONFIG)" || { echo "$(RED)$(KUBECONFIG) not found. Run 'make -C on-prem up' first.$(NC)"; exit 1; }
+	@server=$$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'); \
+	case "$$server" in \
+		https://127.0.0.1:*|https://localhost:*) ;; \
+		*) echo "$(RED)Refusing to use non-local cluster: $$server$(NC)"; exit 1 ;; \
+	esac
 
 # Default target
 help: ## Show this help message
@@ -24,21 +45,25 @@ help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  $(BLUE)%-20s$(NC) %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 # Development targets
+proto: ## Regenerate protobuf code (requires protoc, protoc-gen-go, protoc-gen-go-grpc)
+	@echo "$(BLUE)Generating protobuf code...$(NC)"
+	cd app && \
+	protoc --go_out=. --go_opt=paths=source_relative \
+		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
+		proto/user.proto
+
 build: ## Build the Go application
 	@echo "$(BLUE)Building Go application...$(NC)"
 	cd app && \
 	go mod download && \
-	protoc --go_out=. --go_opt=paths=source_relative \
-		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
-		proto/user.proto && \
-	CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main ./src
+	CGO_ENABLED=0 go build -trimpath -o main ./src
 
 test: ## Run tests
 	@echo "$(BLUE)Running tests...$(NC)"
 	cd app && \
-	go test -v ./... && \
 	go vet ./... && \
-	gofmt -s -l . | wc -l | xargs -I {} test {} -eq 0
+	test -z "$$(gofmt -s -l .)" || { echo "Run 'gofmt -s -w .' on:"; gofmt -s -l .; exit 1; } && \
+	go test -race -v ./...
 
 lint: ## Run linters
 	@echo "$(BLUE)Running linters...$(NC)"
@@ -48,8 +73,8 @@ lint: ## Run linters
 security-scan: ## Run security scan
 	@echo "$(BLUE)Running security scan...$(NC)"
 	cd app && \
-	go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest && \
-	gosec -fmt json -out gosec-report.json ./...
+	go install github.com/securego/gosec/v2/cmd/gosec@v2.21.4 && \
+	gosec -exclude-generated -fmt json -out gosec-report.json -stdout -verbose=text ./...
 
 # Docker targets
 docker-build: ## Build Docker image
@@ -66,79 +91,93 @@ docker-run: ## Run Docker container locally
 	docker run -p 8080:8080 -p 50051:50051 $(DOCKER_REGISTRY)/$(IMAGE_NAME):$(VERSION)
 
 # Kubernetes targets
-k8s-apply: ## Apply Kubernetes manifests
+k8s-apply: guard-local ## Apply Kubernetes manifests
 	@echo "$(BLUE)Applying Kubernetes manifests...$(NC)"
 	kubectl apply -f k8s/manifests/
 
-k8s-delete: ## Delete Kubernetes resources
+k8s-delete: guard-local ## Delete Kubernetes resources
 	@echo "$(BLUE)Deleting Kubernetes resources...$(NC)"
 	kubectl delete -f k8s/manifests/ --ignore-not-found=true
 
-k8s-status: ## Check Kubernetes deployment status
+k8s-status: guard-local ## Check Kubernetes deployment status
 	@echo "$(BLUE)Checking deployment status...$(NC)"
 	kubectl get pods -n $(NAMESPACE)
 	kubectl get svc -n $(NAMESPACE)
 	kubectl get ingress -n $(NAMESPACE)
 
 # Helm targets
-helm-install: ## Install Helm chart
+HELM_VALUES := -f $(HELM_CHART)/values.yaml -f $(HELM_CHART)/values-$(ENVIRONMENT).yaml \
+	--set image.repository=$(DOCKER_REGISTRY)/$(IMAGE_NAME) --set-string image.tag=$(VERSION)
+
+helm-lint: ## Lint the Helm chart for every environment
+	@echo "$(BLUE)Linting Helm chart...$(NC)"
+	for env in dev staging prod; do \
+		helm lint $(HELM_CHART) -f $(HELM_CHART)/values-$$env.yaml || exit 1; \
+	done
+
+helm-template: ## Render the Helm chart for ENVIRONMENT
+	helm template $(RELEASE) $(HELM_CHART) --namespace $(ENV_NAMESPACE) $(HELM_VALUES)
+
+helm-install: guard-local ## Install Helm chart (manual deploy; ArgoCD-managed envs deploy via Git)
 	@echo "$(BLUE)Installing Helm chart...$(NC)"
-	helm upgrade --install $(IMAGE_NAME)-$(ENVIRONMENT) k8s/helm/$(IMAGE_NAME) \
-		--namespace $(NAMESPACE)-$(ENVIRONMENT) \
+	helm upgrade --install $(RELEASE) $(HELM_CHART) \
+		--namespace $(ENV_NAMESPACE) \
 		--create-namespace \
-		--set image.tag=$(VERSION)
+		$(HELM_VALUES)
 
-helm-uninstall: ## Uninstall Helm chart
+helm-uninstall: guard-local ## Uninstall Helm chart
 	@echo "$(BLUE)Uninstalling Helm chart...$(NC)"
-	helm uninstall $(IMAGE_NAME)-$(ENVIRONMENT) -n $(NAMESPACE)-$(ENVIRONMENT)
+	helm uninstall $(RELEASE) -n $(ENV_NAMESPACE)
 
-helm-upgrade: ## Upgrade Helm chart
+helm-upgrade: guard-local ## Upgrade Helm chart
 	@echo "$(BLUE)Upgrading Helm chart...$(NC)"
-	helm upgrade $(IMAGE_NAME)-$(ENVIRONMENT) k8s/helm/$(IMAGE_NAME) \
-		--namespace $(NAMESPACE)-$(ENVIRONMENT) \
-		--set image.tag=$(VERSION)
+	helm upgrade $(RELEASE) $(HELM_CHART) \
+		--namespace $(ENV_NAMESPACE) \
+		$(HELM_VALUES)
 
-helm-status: ## Check Helm release status
+helm-status: guard-local ## Check Helm release status
 	@echo "$(BLUE)Checking Helm release status...$(NC)"
-	helm status $(IMAGE_NAME)-$(ENVIRONMENT) -n $(NAMESPACE)-$(ENVIRONMENT)
+	helm status $(RELEASE) -n $(ENV_NAMESPACE)
 
 # Linkerd targets
-linkerd-install: ## Install Linkerd
+linkerd-install: guard-local ## Install Linkerd
 	@echo "$(BLUE)Installing Linkerd...$(NC)"
+	linkerd check --pre
 	linkerd install --crds | kubectl apply -f -
 	linkerd install | kubectl apply -f -
-	linkerd check
+	linkerd check --wait 5m
 
-linkerd-inject: ## Inject Linkerd into namespace
+linkerd-inject: guard-local ## Inject Linkerd into namespace
 	@echo "$(BLUE)Injecting Linkerd into namespace...$(NC)"
-	kubectl label namespace $(NAMESPACE)-$(ENVIRONMENT) linkerd.io/inject=enabled --overwrite
+	kubectl label namespace $(ENV_NAMESPACE) linkerd.io/inject=enabled --overwrite
 
-linkerd-dashboard: ## Open Linkerd dashboard
+linkerd-dashboard: guard-local ## Open Linkerd dashboard
 	@echo "$(BLUE)Opening Linkerd dashboard...$(NC)"
 	linkerd dashboard
 
 # ArgoCD targets
-argocd-install: ## Install ArgoCD
+argocd-install: guard-local ## Install ArgoCD
 	@echo "$(BLUE)Installing ArgoCD...$(NC)"
 	kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
 	kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 
-argocd-apps: ## Deploy ArgoCD applications
+argocd-apps: guard-local ## Deploy ArgoCD applications (app-of-apps)
 	@echo "$(BLUE)Deploying ArgoCD applications...$(NC)"
-	kubectl apply -f argocd/applications/
+	kubectl apply -f argocd/app-of-apps.yaml
 
-argocd-dashboard: ## Port forward ArgoCD dashboard
+argocd-dashboard: guard-local ## Port forward ArgoCD dashboard
 	@echo "$(BLUE)Port forwarding ArgoCD dashboard...$(NC)"
 	kubectl port-forward svc/argocd-server -n argocd 8080:443
 
 # Jenkins targets
-jenkins-install: ## Install Jenkins
+jenkins-install: guard-local ## Install Jenkins
 	@echo "$(BLUE)Installing Jenkins...$(NC)"
 	kubectl create namespace jenkins --dry-run=client -o yaml | kubectl apply -f -
 	helm repo add jenkins https://charts.jenkins.io
-	helm install jenkins jenkins/jenkins -n jenkins
+	helm repo update jenkins
+	helm upgrade --install jenkins jenkins/jenkins -n jenkins -f jenkins/values.yaml
 
-jenkins-dashboard: ## Port forward Jenkins dashboard
+jenkins-dashboard: guard-local ## Port forward Jenkins dashboard
 	@echo "$(BLUE)Port forwarding Jenkins dashboard...$(NC)"
 	kubectl port-forward svc/jenkins -n jenkins 8081:80
 
@@ -163,27 +202,23 @@ setup-infrastructure: ## Setup complete infrastructure
 # Utility targets
 clean: ## Clean up build artifacts
 	@echo "$(BLUE)Cleaning up...$(NC)"
-	cd app && rm -f main
-	docker system prune -f
+	cd app && rm -f main gosec-report.json
 
-logs: ## Show application logs
+logs: guard-local ## Show application logs
 	@echo "$(BLUE)Showing application logs...$(NC)"
-	kubectl logs -f deployment/$(IMAGE_NAME) -n $(NAMESPACE)-$(ENVIRONMENT)
+	kubectl logs -f deployment/$(RELEASE) -c $(IMAGE_NAME) -n $(ENV_NAMESPACE)
 
-port-forward: ## Port forward to service
+port-forward: guard-local ## Port forward to service
 	@echo "$(BLUE)Port forwarding to service...$(NC)"
-	kubectl port-forward svc/$(IMAGE_NAME)-$(ENVIRONMENT) 8080:80 -n $(NAMESPACE)-$(ENVIRONMENT)
+	kubectl port-forward svc/$(RELEASE) 8080:80 -n $(ENV_NAMESPACE)
 
 health-check: ## Run health check
 	@echo "$(BLUE)Running health check...$(NC)"
 	curl -f http://localhost:8080/health || echo "$(RED)Health check failed$(NC)"
 
-# CI/CD targets
+# CI targets (deployment is done by ArgoCD from Git, see jenkins/Jenkinsfile)
 ci-build: build test security-scan docker-build ## Run CI build pipeline
 	@echo "$(GREEN)CI build completed successfully$(NC)"
-
-ci-deploy: docker-push helm-upgrade ## Run CI deploy pipeline
-	@echo "$(GREEN)CI deploy completed successfully$(NC)"
 
 # All-in-one targets
 all: build test docker-build docker-push helm-install ## Build, test, and deploy everything

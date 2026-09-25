@@ -3,7 +3,7 @@
 # Setup Infrastructure Script
 # This script sets up the complete infrastructure for the GitOps workflow
 
-set -e
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'
@@ -11,9 +11,24 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Always run from the repository root
+cd "$(dirname "$0")/.."
+
+# SAFETY: this is a test repo. Always use the local kind cluster from on-prem/
+# (never the default ~/.kube/config) and refuse to talk to a non-local API server.
+export KUBECONFIG="$PWD/on-prem/.kube/config"
+guard_local_cluster() {
+    [ -f "$KUBECONFIG" ] || { echo -e "${RED}❌ $KUBECONFIG not found. Run 'make -C on-prem up' first.${NC}"; exit 1; }
+    local server
+    server=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+    case "$server" in
+        https://127.0.0.1:*|https://localhost:*) ;;
+        *) echo -e "${RED}❌ Refusing to use non-local cluster: ${server}${NC}"; exit 1 ;;
+    esac
+}
+
 # Configuration
 DOCKER_REGISTRY=${DOCKER_REGISTRY:-"your-registry.com"}
-CLUSTER_NAME=${CLUSTER_NAME:-"gitops-cluster"}
 NAMESPACE_PREFIX=${NAMESPACE_PREFIX:-"user-service"}
 
 echo -e "${GREEN}🚀 Setting up GitOps Infrastructure${NC}"
@@ -40,11 +55,7 @@ check_prerequisites() {
     if ! command_exists docker; then
         missing_tools+=("docker")
     fi
-    
-    if ! command_exists linkerd; then
-        missing_tools+=("linkerd")
-    fi
-    
+
     if [ ${#missing_tools[@]} -ne 0 ]; then
         echo -e "${RED}❌ Missing required tools: ${missing_tools[*]}${NC}"
         echo "Please install the missing tools and try again."
@@ -65,16 +76,16 @@ setup_linkerd() {
         export PATH=$PATH:$HOME/.linkerd2/bin
     fi
     
-    # Install Linkerd
+    # Validate the cluster before installing
+    linkerd check --pre
+
+    # Install Linkerd (idempotent: re-applying the manifests is safe)
     linkerd install --crds | kubectl apply -f -
     linkerd install | kubectl apply -f -
-    
-    # Wait for Linkerd to be ready
+
+    # Wait for the control plane and verify the installation
     echo "Waiting for Linkerd to be ready..."
-    kubectl wait --for=condition=available --timeout=300s deployment/linkerd-controller -n linkerd
-    
-    # Verify installation
-    linkerd check
+    linkerd check --wait 5m
     
     echo -e "${GREEN}✅ Linkerd installed successfully${NC}"
 }
@@ -93,17 +104,7 @@ setup_argocd() {
     echo "Waiting for ArgoCD to be ready..."
     kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
     
-    # Get ArgoCD admin password
-    ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
     echo -e "${GREEN}✅ ArgoCD installed successfully${NC}"
-    echo -e "${YELLOW}📝 ArgoCD admin password: ${ARGOCD_PASSWORD}${NC}"
-    
-    # Port forward ArgoCD server
-    echo "Starting ArgoCD port forward..."
-    kubectl port-forward svc/argocd-server -n argocd 8080:443 &
-    ARGOCD_PID=$!
-    echo "ArgoCD is available at https://localhost:8080"
-    echo "Username: admin, Password: ${ARGOCD_PASSWORD}"
 }
 
 # Function to setup Jenkins
@@ -117,31 +118,16 @@ setup_jenkins() {
     helm repo add jenkins https://charts.jenkins.io
     helm repo update
     
-    # Install Jenkins
-    helm install jenkins jenkins/jenkins \
+    # Install Jenkins (the chart generates a random admin password)
+    helm upgrade --install jenkins jenkins/jenkins \
         --namespace jenkins \
-        --set controller.serviceType=LoadBalancer \
-        --set controller.servicePort=80 \
-        --set controller.adminUser=admin \
-        --set controller.adminPassword=admin \
-        --set persistence.enabled=true \
-        --set persistence.size=8Gi
-    
-    # Wait for Jenkins to be ready
+        --values jenkins/values.yaml
+
+    # Wait for Jenkins to be ready (the controller is a StatefulSet)
     echo "Waiting for Jenkins to be ready..."
-    kubectl wait --for=condition=available --timeout=300s deployment/jenkins -n jenkins
-    
-    # Get Jenkins admin password
-    JENKINS_PASSWORD=$(kubectl get secret --namespace jenkins jenkins -o jsonpath="{.data.jenkins-admin-password}" | base64 -d)
+    kubectl rollout status statefulset/jenkins -n jenkins --timeout=600s
+
     echo -e "${GREEN}✅ Jenkins installed successfully${NC}"
-    echo -e "${YELLOW}📝 Jenkins admin password: ${JENKINS_PASSWORD}${NC}"
-    
-    # Port forward Jenkins
-    echo "Starting Jenkins port forward..."
-    kubectl port-forward svc/jenkins -n jenkins 8081:80 &
-    JENKINS_PID=$!
-    echo "Jenkins is available at http://localhost:8081"
-    echo "Username: admin, Password: ${JENKINS_PASSWORD}"
 }
 
 # Function to setup monitoring
@@ -155,15 +141,13 @@ setup_monitoring() {
     # Create monitoring namespace
     kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
     
-    # Install Prometheus
-    helm install prometheus prometheus-community/kube-prometheus-stack \
+    # Install Prometheus (Grafana admin password is generated by the chart)
+    helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
         --namespace monitoring \
-        --set grafana.adminPassword=admin \
         --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
         --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false
-    
+
     echo -e "${GREEN}✅ Monitoring stack installed successfully${NC}"
-    echo "Grafana is available at http://localhost:3000 (admin/admin)"
 }
 
 # Function to create namespaces
@@ -189,8 +173,8 @@ deploy_argocd_apps() {
     # Wait for ArgoCD to be ready
     kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
     
-    # Apply ArgoCD applications
-    kubectl apply -f argocd/applications/
+    # The app-of-apps creates and manages everything in argocd/applications/
+    kubectl apply -f argocd/app-of-apps.yaml
     
     echo -e "${GREEN}✅ ArgoCD applications deployed${NC}"
 }
@@ -199,10 +183,8 @@ deploy_argocd_apps() {
 build_and_push_image() {
     echo -e "${YELLOW}🐳 Building and pushing Docker image...${NC}"
     
-    cd app
-    
     # Build image
-    docker build -t "${DOCKER_REGISTRY}/user-service:latest" .
+    docker build -t "${DOCKER_REGISTRY}/user-service:latest" app
     
     # Push image (if registry is configured)
     if [ "$DOCKER_REGISTRY" != "your-registry.com" ]; then
@@ -211,8 +193,6 @@ build_and_push_image() {
     else
         echo -e "${YELLOW}⚠️  Skipping push - please configure DOCKER_REGISTRY${NC}"
     fi
-    
-    cd ..
 }
 
 # Main execution
@@ -220,6 +200,7 @@ main() {
     echo -e "${GREEN}🎯 Starting GitOps Infrastructure Setup${NC}"
     
     check_prerequisites
+    guard_local_cluster
     setup_linkerd
     setup_argocd
     setup_jenkins
@@ -231,15 +212,21 @@ main() {
     echo -e "${GREEN}🎉 Infrastructure setup completed successfully!${NC}"
     echo ""
     echo -e "${YELLOW}📋 Access Information:${NC}"
-    echo "ArgoCD: https://localhost:8080 (admin/${ARGOCD_PASSWORD})"
-    echo "Jenkins: http://localhost:8081 (admin/${JENKINS_PASSWORD})"
-    echo "Grafana: http://localhost:3000 (admin/admin)"
+    echo "ArgoCD:  make argocd-dashboard  -> https://localhost:8080  (user: admin)"
+    echo "         password: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+    echo "Jenkins: make jenkins-dashboard -> http://localhost:8081   (user: admin)"
+    echo "         password: kubectl -n jenkins get secret jenkins -o jsonpath='{.data.jenkins-admin-password}' | base64 -d"
+    echo "Grafana: kubectl port-forward svc/prometheus-grafana -n monitoring 3000:80 -> http://localhost:3000 (user: admin)"
+    echo "         password: kubectl -n monitoring get secret prometheus-grafana -o jsonpath='{.data.admin-password}' | base64 -d"
     echo ""
     echo -e "${YELLOW}🔧 Next Steps:${NC}"
-    echo "1. Configure your Docker registry in Jenkins"
-    echo "2. Set up Git webhooks for automatic builds"
-    echo "3. Configure Slack notifications in Jenkins"
-    echo "4. Test the deployment pipeline"
+    echo "1. Create the registry secret used by the Jenkins agents:"
+    echo "   kubectl create secret docker-registry registry-credentials -n jenkins \\"
+    echo "     --docker-server=<registry> --docker-username=<user> --docker-password=<token>"
+    echo "2. Add Jenkins credentials 'git-credentials' (repo push access) and 'argocd-token'"
+    echo "3. Set up Git webhooks for automatic builds"
+    echo "4. Configure Slack notifications in Jenkins"
+    echo "5. Test the deployment pipeline"
 }
 
 # Run main function

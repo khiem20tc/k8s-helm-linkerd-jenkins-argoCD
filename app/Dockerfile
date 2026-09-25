@@ -1,10 +1,6 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
-# Install protoc and protoc-gen-go
-RUN apk add --no-cache protoc protoc-gen-go
-
-# Set working directory
 WORKDIR /app
 
 # Copy go mod files
@@ -13,19 +9,14 @@ COPY go.mod go.sum ./
 # Download dependencies
 RUN go mod download
 
-# Copy source code
+# Copy source code (protobuf code is generated and committed; run `make proto` to regenerate)
 COPY . .
 
-# Generate protobuf files
-RUN protoc --go_out=. --go_opt=paths=source_relative \
-    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-    proto/user.proto
-
 # Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main ./src
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o main ./src
 
 # Final stage
-FROM alpine:latest
+FROM alpine:3.20
 
 # Install ca-certificates for HTTPS requests
 RUN apk --no-cache add ca-certificates
@@ -36,17 +27,12 @@ RUN addgroup -g 1001 -S appgroup && \
 
 WORKDIR /app
 
-# Copy the binary from builder stage
-COPY --from=builder /app/main .
-
-# Copy config files
-COPY --from=builder /app/configs ./configs
-
-# Change ownership to non-root user
-RUN chown -R appuser:appgroup /app
+# Copy the binary and default config from builder stage
+COPY --from=builder --chown=appuser:appgroup /app/main .
+COPY --from=builder --chown=appuser:appgroup /app/configs ./configs
 
 # Switch to non-root user
-USER appuser
+USER 1001:1001
 
 # Expose ports
 EXPOSE 8080 50051

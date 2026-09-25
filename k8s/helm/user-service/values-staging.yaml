@@ -1,0 +1,23 @@
+# Staging overrides. image.tag is updated by Jenkins (see jenkins/Jenkinsfile).
+image:
+  tag: "latest"
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+
+ingress:
+  hosts:
+    - host: user-service-staging.local
+      paths:
+        - path: /
+          pathType: Prefix
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi

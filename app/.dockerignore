@@ -1,0 +1,5 @@
+main
+*.test
+*.out
+gosec-report.json
+.git

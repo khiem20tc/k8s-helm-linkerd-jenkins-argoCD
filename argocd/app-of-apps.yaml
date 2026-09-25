@@ -9,7 +9,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/khiem20tc/k8s-helm-linkerd-jenkins-argoCD.git
-    targetRevision: HEAD
+    targetRevision: main
     path: argocd/applications
   destination:
     server: https://kubernetes.default.svc

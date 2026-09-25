@@ -15,10 +15,10 @@ This document describes the complete GitOps workflow for deploying a Golang gRPC
 - **Triggers**: Webhooks for automatic CI/CD pipeline execution
 
 ### 2. CI/CD Pipeline (Jenkins)
-- **Build Stage**: Compile Go application, generate protobuf files
-- **Test Stage**: Unit tests, integration tests, security scanning
-- **Package Stage**: Build Docker image, push to registry
-- **Deploy Stage**: Update Helm values, deploy to environments
+- **Test Stage**: go vet, gofmt, unit tests with the race detector, gosec
+- **Package Stage**: Build and push an immutable image with kaniko
+- **Release Stage**: Commit the image tag to `values-<env>.yaml`; ArgoCD deploys it
+- **Verify Stage**: Wait for ArgoCD Synced/Healthy, then smoke test `/health`
 
 ### 3. GitOps Controller (ArgoCD)
 - **Application Management**: Manages application deployments across environments
@@ -36,7 +36,6 @@ This document describes the complete GitOps workflow for deploying a Golang gRPC
 - **Traffic Management**: Load balancing, retry policies
 - **Security**: mTLS between services
 - **Observability**: Metrics, tracing, monitoring
-- **Traffic Splitting**: Canary deployments
 
 ## Workflow Steps
 
@@ -53,72 +52,79 @@ git push origin feature/new-endpoint
 
 ### 2. CI/CD Pipeline Execution
 
-#### Build Stage
+#### Test Stage
 ```yaml
-- Build Go application
-- Generate protobuf files
-- Run unit tests
+- go vet and gofmt checks
+- Unit tests (go test -race)
 - Security scanning with gosec
-- Code quality checks
 ```
 
 #### Package Stage
 ```yaml
-- Build Docker image
-- Tag with version
+- Build Docker image with kaniko (protobuf code is committed; `make proto` regenerates it)
+- Tag with `git describe --tags --always`
 - Push to container registry
-- Update Helm chart values
 ```
 
-#### Deploy Stage
+#### Release Stage
 ```yaml
-- Deploy to development environment
-- Run integration tests
-- Update ArgoCD application
+- Manual approval (prod only)
+- Commit image tag to k8s/helm/user-service/values-<env>.yaml with [skip ci]
+- Wait for ArgoCD to sync and report Healthy
+- Smoke test the service
 - Notify team via Slack
 ```
+
+Jenkins never runs `helm upgrade` itself. Git is the single source of truth, so
+ArgoCD self-heal never fights a manual release.
 
 ### 3. GitOps Deployment
 
 #### ArgoCD Sync Process
-1. **Detection**: ArgoCD detects changes in Git repository
-2. **Validation**: Validates Kubernetes manifests
+1. **Detection**: ArgoCD detects changes in Git repository (Jenkins triggers a refresh)
+2. **Rendering**: Renders the Helm chart with `values.yaml` + `values-<env>.yaml`
 3. **Deployment**: Applies changes to target environment
 4. **Monitoring**: Monitors deployment health
-5. **Rollback**: Automatic rollback on failure
+5. **Rollback**: Revert the deploy commit in Git
 
 #### Environment Promotion
-```bash
-# Development → Staging
-argocd app sync user-service-staging
+Promotion re-uses the image that was tested in the previous environment. Run the
+Jenkins job with `VERSION` set to an existing tag; it skips the build and only
+updates the target environment's values file.
 
-# Staging → Production (with approval)
-argocd app sync user-service-prod
+```text
+Development → Staging:  ENVIRONMENT=staging  VERSION=v1.2.3
+Staging → Production:   ENVIRONMENT=prod     VERSION=v1.2.3   (manual approval)
 ```
 
 ### 4. Service Mesh Integration
 
 #### Linkerd Features
 - **Automatic mTLS**: Secure communication between services
-- **Traffic Splitting**: Gradual rollout of new versions
-- **Retry Policies**: Automatic retry on transient failures
-- **Circuit Breaking**: Prevent cascade failures
+- **Retry Policies**: Retries for idempotent gRPC calls (`GetUser`, `ListUsers`) within a retry budget
+- **Timeouts**: Per-route timeouts
+- **Per-route Metrics**: Success rate and latency per gRPC method
 
 #### Service Profile Configuration
+Rendered by `k8s/helm/user-service/templates/serviceprofile.yaml`
+(toggle with `linkerd.serviceProfile.enabled`). The name must be the Service FQDN:
 ```yaml
 apiVersion: linkerd.io/v1alpha2
 kind: ServiceProfile
 metadata:
-  name: user-service
+  name: user-service-prod.user-service-prod.svc.cluster.local
 spec:
   routes:
-  - name: "gRPC UserService"
+  - name: GetUser
     condition:
       method: POST
-      pathRegex: "/user.UserService/.*"
+      pathRegex: /user\.UserService/GetUser
+    isRetryable: true
+    timeout: 5s
   retryBudget:
     retryRatio: 0.2
     minRetriesPerSecond: 10
+    ttl: 10s
 ```
 
 ## Environment Configuration
@@ -189,7 +195,7 @@ spec:
 kubectl get pods -n user-service-prod
 
 # Check pod logs
-kubectl logs -f deployment/user-service -n user-service-prod
+kubectl logs -f deployment/user-service-prod -c user-service -n user-service-prod
 
 # Check pod events
 kubectl describe pod <pod-name> -n user-service-prod
@@ -201,11 +207,11 @@ kubectl describe pod <pod-name> -n user-service-prod
 kubectl get endpoints -n user-service-prod
 
 # Check service configuration
-kubectl get svc user-service -n user-service-prod -o yaml
+kubectl get svc user-service-prod -n user-service-prod -o yaml
 
 # Test connectivity
-kubectl run test-pod --image=curlimages/curl --rm -i --restart=Never -- \
-  curl -f http://user-service.user-service-prod.svc.cluster.local/health
+kubectl run test-pod -n user-service-prod --image=curlimages/curl --rm -i --restart=Never -- \
+  curl -f http://user-service-prod.user-service-prod.svc.cluster.local/health
 ```
 
 #### 3. ArgoCD Sync Issues
@@ -213,8 +219,8 @@ kubectl run test-pod --image=curlimages/curl --rm -i --restart=Never -- \
 # Check application status
 argocd app get user-service-prod
 
-# Force sync
-argocd app sync user-service-prod
+# Force refresh from Git
+argocd app get user-service-prod --refresh
 
 # Check sync history
 argocd app history user-service-prod
@@ -226,7 +232,7 @@ argocd app history user-service-prod
 kubectl get pods -n user-service-prod -o yaml | grep linkerd
 
 # Check service mesh traffic
-linkerd tap deployment/user-service -n user-service-prod
+linkerd viz tap deployment/user-service-prod -n user-service-prod
 
 # Check Linkerd status
 linkerd check
@@ -236,7 +242,7 @@ linkerd check
 
 ```bash
 # Port forward for local testing
-kubectl port-forward svc/user-service 8080:80 -n user-service-prod
+kubectl port-forward svc/user-service-prod 8080:80 -n user-service-prod
 
 # Check application health
 curl http://localhost:8080/health
@@ -275,7 +281,7 @@ kubectl port-forward svc/argocd-server -n argocd 8080:443
 - Enable mTLS for all services
 - Configure proper retry policies
 - Monitor service mesh metrics
-- Use traffic splitting for canary deployments
+- Consider progressive delivery (e.g. Flagger or Argo Rollouts) for canary deployments
 
 ### 5. Monitoring
 - Set up comprehensive alerting

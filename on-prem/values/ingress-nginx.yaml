@@ -1,0 +1,22 @@
+# ingress-nginx for kind: bind hostPorts 80/443 on the node that kind maps to the host.
+controller:
+  hostPort:
+    enabled: true
+  service:
+    type: ClusterIP
+  nodeSelector:
+    ingress-ready: "true"
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  ingressClassResource:
+    default: true
+  publishService:
+    enabled: false
+  extraArgs:
+    publish-status-address: localhost
+  resources:
+    requests:
+      cpu: 50m
+      memory: 90Mi
